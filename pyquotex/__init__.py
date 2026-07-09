@@ -1,0 +1,43 @@
+"""A python wrapper for Quotex API."""
+import logging
+
+from .types import (
+    AssetInfo,
+    Balance,
+    Candle,
+    ProfileInfo,
+    ReconnectPolicy,
+    Subscription,
+    TradeDirection,
+    TradeResult,
+    TradeStatus,
+)
+
+
+def _prepare_logging() -> None:
+    """Prepare logger for module Quotex API."""
+    logger = logging.getLogger(__name__)
+    # logger.setLevel(logging.DEBUG)
+    if not logger.handlers:
+        logger.addHandler(logging.NullHandler())
+
+    websocket_logger = logging.getLogger("websockets")
+    websocket_logger.setLevel(logging.WARNING)
+    if not websocket_logger.handlers:
+        websocket_logger.addHandler(logging.NullHandler())
+
+
+_prepare_logging()
+
+
+__all__ = [
+    "AssetInfo",
+    "Balance",
+    "Candle",
+    "ProfileInfo",
+    "ReconnectPolicy",
+    "Subscription",
+    "TradeDirection",
+    "TradeResult",
+    "TradeStatus",
+]
