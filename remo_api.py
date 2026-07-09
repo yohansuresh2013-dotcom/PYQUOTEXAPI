@@ -163,137 +163,10 @@ class QuotexManager:
 manager = QuotexManager()
 
 
-# --------------------------------------------------------------------------
-# Broadcast layer — continuous backend polling + WebSocket fan-out
-# --------------------------------------------------------------------------
-# Runs regardless of whether any browser is connected. Browsers that open
-# the chart subscribe to this single shared stream instead of each hitting
-# Quotex-backed endpoints themselves, so N open tabs = 1x backend load,
-# not Nx.
-
-BROADCAST_ASSETS = [
-    a.strip() for a in os.getenv("BROADCAST_ASSETS", "").split(",") if a.strip()
-]
-BROADCAST_POLL_INTERVAL = float(os.getenv("BROADCAST_POLL_INTERVAL", "1.0"))
-BROADCAST_MAX_ASSETS = int(os.getenv("BROADCAST_MAX_ASSETS", "15"))
-
-
-class ConnectionManager:
-    """Tracks connected browsers and fans out broadcast messages to all of them."""
-
-    def __init__(self) -> None:
-        self.active: set[WebSocket] = set()
-        self.lock = asyncio.Lock()
-
-    async def connect(self, websocket: WebSocket) -> None:
-        await websocket.accept()
-        async with self.lock:
-            self.active.add(websocket)
-        logger.info("Broadcast client connected (%d total)", len(self.active))
-
-    async def disconnect(self, websocket: WebSocket) -> None:
-        async with self.lock:
-            self.active.discard(websocket)
-        logger.info("Broadcast client disconnected (%d total)", len(self.active))
-
-    async def broadcast(self, message: dict[str, Any]) -> None:
-        if not self.active:
-            return
-        dead: list[WebSocket] = []
-        async with self.lock:
-            targets = list(self.active)
-        for ws in targets:
-            try:
-                await ws.send_json(message)
-            except Exception:  # noqa: BLE001
-                dead.append(ws)
-        if dead:
-            async with self.lock:
-                for ws in dead:
-                    self.active.discard(ws)
-
-
-broadcast_manager = ConnectionManager()
-
-
-async def _resolve_broadcast_assets(client: "Quotex") -> list[str]:
-    """Which assets to continuously poll: explicit env list, else the
-    top N open assets by payout, refreshed each time this is called."""
-    if BROADCAST_ASSETS:
-        return BROADCAST_ASSETS[:BROADCAST_MAX_ASSETS]
-    try:
-        instruments = await manager.get_instruments_cached()
-        open_symbols = [
-            row[1] for row in instruments
-            if len(row) > 14 and row[14] and len(row) > 1
-        ]
-        return open_symbols[:BROADCAST_MAX_ASSETS]
-    except Exception:  # noqa: BLE001
-        return [DEFAULT_ASSET]
-
-
-async def broadcast_loop() -> None:
-    """Background task: continuously fetches prices for a set of assets
-    and pushes them to all connected browsers, independent of whether
-    anyone is actually connected. Runs for the lifetime of the server."""
-    assets_cache: list[str] = []
-    assets_cache_ts = 0.0
-    assets_refresh_interval = 60.0
-    subscribed: set[str] = set()
-
-    while True:
-        try:
-            await asyncio.sleep(BROADCAST_POLL_INTERVAL)
-            if manager.client is None or not manager.connected:
-                continue
-
-            now = time.time()
-            if now - assets_cache_ts > assets_refresh_interval or not assets_cache:
-                assets_cache = await _resolve_broadcast_assets(manager.client)
-                assets_cache_ts = now
-
-            if not assets_cache:
-                continue
-
-            # Subscribe to any newly-added assets once; start_realtime_price
-            # kicks off the underlying WS stream that get_realtime_price
-            # then reads from on every subsequent poll.
-            for symbol in assets_cache:
-                if symbol not in subscribed:
-                    try:
-                        await manager.client.start_realtime_price(symbol, 0)
-                        subscribed.add(symbol)
-                    except Exception:  # noqa: BLE001
-                        pass  # will retry next cycle if still unsubscribed
-
-            # Backend keeps polling even with zero browsers connected —
-            # that's the whole point (data stays warm, no cold-start lag
-            # when the first browser of the day opens the page).
-            payload: dict[str, Any] = {"type": "prices", "data": {}}
-            for symbol in assets_cache:
-                try:
-                    data = await manager.client.get_realtime_price(symbol)
-                    payload["data"][symbol] = data[-1] if data else None
-                except Exception:  # noqa: BLE001
-                    payload["data"][symbol] = None
-
-            await broadcast_manager.broadcast(payload)
-        except asyncio.CancelledError:
-            break
-        except Exception:  # noqa: BLE001
-            logger.exception("broadcast_loop iteration failed")
-
-
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     await manager.start()
-    broadcast_task = asyncio.create_task(broadcast_loop())
     yield
-    broadcast_task.cancel()
-    try:
-        await broadcast_task
-    except asyncio.CancelledError:
-        pass
     await manager.shutdown()
 
 
@@ -310,30 +183,6 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-
-@app.websocket("/ws/broadcast")
-async def ws_broadcast(websocket: WebSocket):
-    """Shared real-time price stream. All connected browsers receive the
-    same backend-driven updates — opening more tabs doesn't create more
-    load on Quotex, since the backend polls independently either way."""
-    await broadcast_manager.connect(websocket)
-    try:
-        while True:
-            # Actively send a small heartbeat rather than blocking on
-            # receive_text() (which waits for client input that never
-            # comes on a push-only stream). Some proxies/load balancers
-            # silently drop WebSocket connections that look idle at the
-            # TCP level even if the WS-level ping/pong is technically
-            # fine — sending real application data keeps it visibly alive.
-            await asyncio.sleep(20)
-            await websocket.send_json({"type": "heartbeat", "time": time.time()})
-    except WebSocketDisconnect:
-        pass
-    except Exception:  # noqa: BLE001
-        logger.exception("ws_broadcast error")
-    finally:
-        await broadcast_manager.disconnect(websocket)
 
 
 # --------------------------------------------------------------------------
