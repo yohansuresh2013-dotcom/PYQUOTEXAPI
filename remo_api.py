@@ -320,9 +320,14 @@ async def ws_broadcast(websocket: WebSocket):
     await broadcast_manager.connect(websocket)
     try:
         while True:
-            # This endpoint is push-only; just keep the connection alive
-            # and drop any client messages (ping/pong handled by FastAPI).
-            await websocket.receive_text()
+            # Actively send a small heartbeat rather than blocking on
+            # receive_text() (which waits for client input that never
+            # comes on a push-only stream). Some proxies/load balancers
+            # silently drop WebSocket connections that look idle at the
+            # TCP level even if the WS-level ping/pong is technically
+            # fine — sending real application data keeps it visibly alive.
+            await asyncio.sleep(20)
+            await websocket.send_json({"type": "heartbeat", "time": time.time()})
     except WebSocketDisconnect:
         pass
     except Exception:  # noqa: BLE001
