@@ -106,10 +106,17 @@ class QuotexManager:
 
         Uses get_balance() as a real round-trip request rather than just
         checking a flag, since a socket can look "connected" while silently
-        dead. A cooldown prevents reconnect-storming on repeated failures.
+        dead. Uses exponential backoff on repeated failures so a genuine
+        block/rate-limit from Quotex isn't made worse by hammering retries
+        every ~15-20s indefinitely — cooldown grows 10s -> 20s -> 40s ...
+        up to a 10 minute cap, and resets to 10s the moment a connection
+        actually succeeds.
         """
         last_reconnect = 0.0
         cooldown = 10.0
+        max_cooldown = 600.0  # 10 minutes
+        consecutive_failures = 0
+
         while True:
             await asyncio.sleep(15)
             try:
@@ -117,6 +124,10 @@ class QuotexManager:
                     continue
                 await asyncio.wait_for(self.client.get_balance(), timeout=8)
                 self.connected = True
+                if consecutive_failures > 0:
+                    logger.info("Quotex connection recovered after %d failed attempt(s)", consecutive_failures)
+                consecutive_failures = 0
+                cooldown = 10.0
             except Exception as exc:  # noqa: BLE001
                 self.connected = False
                 self.last_error = str(exc)
@@ -124,8 +135,16 @@ class QuotexManager:
                 if now - last_reconnect < cooldown:
                     continue
                 last_reconnect = now
-                logger.warning("Hard ping failed (%s), reconnecting...", exc)
+                consecutive_failures += 1
+                logger.warning(
+                    "Hard ping failed (%s), reconnecting... (attempt %d, next cooldown %.0fs)",
+                    exc, consecutive_failures, cooldown,
+                )
                 await self._connect()
+                # Grow the cooldown for next time regardless of outcome —
+                # if _connect() succeeded, get_balance() will confirm on
+                # the next loop iteration and reset it back to 10s.
+                cooldown = min(cooldown * 2, max_cooldown)
 
     async def ensure_connected(self) -> Quotex:
         if self.client is None:
