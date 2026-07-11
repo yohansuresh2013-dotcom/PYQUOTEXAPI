@@ -67,6 +67,10 @@ class QuotexManager:
         self._assets_cache: dict[str, Any] = {}
         self._assets_cache_ts: float = 0.0
         self._assets_cache_ttl: float = 30.0
+        # Tracks the last time each asset's price stream was subscribed
+        # to, so the watchdog can detect if a subscribed stream has gone
+        # quiet (no fresh ticks) despite the connection itself being alive.
+        self._subscribed_assets: dict[str, float] = {}
 
     async def start(self) -> None:
         if not QUOTEX_EMAIL or not QUOTEX_PASSWORD:
@@ -101,6 +105,28 @@ class QuotexManager:
                 self.last_error = str(exc)
                 logger.exception("Quotex connect raised an exception")
 
+    def _check_stale_streams(self, threshold_seconds: float) -> list[str]:
+        """Checks tracked asset subscriptions for stale data — a subscribed
+        asset with no fresh tick in over `threshold_seconds`. Returns the
+        list of stale asset symbols, or an empty list if all is well /
+        nothing is currently tracked (e.g. no /price calls made yet)."""
+        if self.client is None or not self._subscribed_assets:
+            return []
+        stale: list[str] = []
+        now = time.time()
+        for symbol, subscribed_at in list(self._subscribed_assets.items()):
+            # Give a fresh subscription a grace period before judging it
+            if now - subscribed_at < threshold_seconds:
+                continue
+            try:
+                data = self.client.api.realtime_price.get(symbol, [])
+                last_tick_time = data[-1].get("time", 0) if data else 0
+                if now - last_tick_time > threshold_seconds:
+                    stale.append(symbol)
+            except Exception:  # noqa: BLE001
+                stale.append(symbol)
+        return stale
+
     async def _watchdog(self) -> None:
         """Background task: hard-pings the connection and reconnects if needed.
 
@@ -111,11 +137,22 @@ class QuotexManager:
         every ~15-20s indefinitely — cooldown grows 10s -> 20s -> 40s ...
         up to a 10 minute cap, and resets to 10s the moment a connection
         actually succeeds.
+
+        Also detects STALE DATA STREAMS: the WebSocket connection itself
+        can stay alive and pass get_balance() pings while a specific
+        asset's price/candle subscription silently stops receiving
+        updates (observed: /price and /candles timing out for a single
+        asset for several minutes, resolved only by a full manual
+        restart). Since get_balance() alone can't detect this, we also
+        check whether any recently-subscribed asset has gone stale and
+        force a full reconnect if so — replicating what a manual restart
+        does, without requiring one.
         """
         last_reconnect = 0.0
         cooldown = 10.0
         max_cooldown = 600.0  # 10 minutes
         consecutive_failures = 0
+        STALE_DATA_THRESHOLD = 90.0  # seconds with zero fresh ticks on any tracked asset
 
         while True:
             await asyncio.sleep(15)
@@ -128,6 +165,17 @@ class QuotexManager:
                     logger.info("Quotex connection recovered after %d failed attempt(s)", consecutive_failures)
                 consecutive_failures = 0
                 cooldown = 10.0
+
+                # Connection pings fine — now check if subscribed data
+                # streams are actually still flowing.
+                stale = self._check_stale_streams(STALE_DATA_THRESHOLD)
+                if stale:
+                    logger.warning(
+                        "Data stream(s) stale for >%.0fs (%s) despite healthy connection — forcing full reconnect",
+                        STALE_DATA_THRESHOLD, ", ".join(stale),
+                    )
+                    await self._connect()
+                    self._subscribed_assets.clear()  # re-subscribe fresh after reconnect
             except Exception as exc:  # noqa: BLE001
                 self.connected = False
                 self.last_error = str(exc)
@@ -384,14 +432,29 @@ async def highest_payouts(limit: int = Query(10, ge=1, le=100), open_only: bool 
 @app.get("/price/{pair}")
 async def price(pair: str, history: bool = Query(False, description="Return full tick buffer instead of just the latest price")):
     client = await manager.ensure_connected()
+    manager._subscribed_assets[pair] = time.time()
     data = await client.get_realtime_price(pair)
-    if not data:
+
+    # Detect a stale subscription: we have cached data, but it's old
+    # enough that Quotex has likely stopped pushing updates for this
+    # asset without the underlying connection actually dropping (the
+    # watchdog's get_balance() ping would still succeed in that case,
+    # so it wouldn't catch this on its own).
+    STALE_THRESHOLD_SECONDS = 30
+    is_stale = False
+    if data:
+        last_tick_time = data[-1].get("time", 0)
+        if time.time() - last_tick_time > STALE_THRESHOLD_SECONDS:
+            is_stale = True
+
+    if not data or is_stale:
         try:
             await client.start_realtime_price(pair, 0)
         except TimeoutError:
             pass  # asset may be closed/illiquid; fall through and check again
         await asyncio.sleep(1.0)
         data = await client.get_realtime_price(pair)
+
     if not data:
         raise HTTPException(status_code=504, detail=f"No realtime price data available for '{pair}' (asset may be closed)")
     if history:
