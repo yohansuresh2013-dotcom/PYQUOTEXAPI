@@ -99,6 +99,22 @@ class QuotexManager:
         async with self.lock:
             if self.client is None:
                 return
+            # CRITICAL: pyquotex's connect() creates a brand-new internal
+            # WebsocketClient + background run_forever() task on every call,
+            # without cancelling the previous one (confirmed in
+            # pyquotex/api.py: self._websocket_task is simply overwritten).
+            # Repeated connect() calls without closing first leave orphaned
+            # reconnect loops running forever in the background, each blind
+            # to state set by later instances — this was the actual root
+            # cause of dozens of concurrent "reconnecting (attempt #N)"
+            # messages piling up. Explicitly closing first ensures the old
+            # task's run_forever() loop sees self._closing=True and exits
+            # cleanly before we start a new one.
+            try:
+                await asyncio.wait_for(self.client.close(), timeout=5)
+            except Exception:  # noqa: BLE001
+                pass  # best-effort — client may never have connected yet
+
             try:
                 ok, reason = await self.client.connect()
                 self.connected = bool(ok)
