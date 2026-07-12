@@ -71,6 +71,13 @@ class QuotexManager:
         # to, so the watchdog can detect if a subscribed stream has gone
         # quiet (no fresh ticks) despite the connection itself being alive.
         self._subscribed_assets: dict[str, float] = {}
+        # Shared with the watchdog: when Quotex explicitly rate-limits us
+        # (HTTP 429), both the watchdog AND ensure_connected() (called on
+        # every single API request) must stop attempting fresh logins
+        # until this window passes — otherwise incoming requests keep
+        # hammering the login endpoint even while the watchdog backs off,
+        # which is what triggered a full IP block in production.
+        self._rate_limited_until: float = 0.0
 
     async def start(self) -> None:
         if not QUOTEX_EMAIL or not QUOTEX_PASSWORD:
@@ -100,9 +107,21 @@ class QuotexManager:
                     logger.info("Connected to Quotex (%s account)", QUOTEX_ACCOUNT)
                 else:
                     logger.error("Quotex connect failed: %s", reason)
+                    reason_text = str(reason).lower()
+                    if "429" in reason_text or "rate limit" in reason_text:
+                        # Single choke point for every reconnect path (watchdog,
+                        # ensure_connected, anything future) — set the shared
+                        # cooldown here so nothing downstream keeps retrying
+                        # into an active Quotex rate limit.
+                        self._rate_limited_until = time.time() + 300.0
+                        logger.error("Quotex rate-limited (429) — blocking all reconnects for 300s")
             except Exception as exc:  # noqa: BLE001
                 self.connected = False
                 self.last_error = str(exc)
+                exc_text = str(exc).lower()
+                if "429" in exc_text or "rate limit" in exc_text:
+                    self._rate_limited_until = time.time() + 300.0
+                    logger.error("Quotex rate-limited (429) — blocking all reconnects for 300s")
                 logger.exception("Quotex connect raised an exception")
 
     def _check_stale_streams(self, threshold_seconds: float) -> list[str]:
@@ -138,24 +157,48 @@ class QuotexManager:
         up to a 10 minute cap, and resets to 10s the moment a connection
         actually succeeds.
 
+        IMPORTANT: pyquotex's own client has its own internal WebSocket
+        idle-recycle and reconnect logic (recycles idle sockets ~60-70s,
+        then reconnects on its own). This watchdog's job is to catch
+        cases pyquotex's own logic *doesn't* handle — not to race it.
+        Forcing a full fresh login (_connect(), a real Quotex sign-in
+        POST) on every single ping failure collides with pyquotex's own
+        concurrent reconnect attempts, doubling login traffic and (as
+        observed in production) triggering Quotex's HTTP 429 rate limit
+        and then an outright 403 block. So: on ping failure, we give
+        pyquotex's own reconnect a real grace period (RECONNECT_GRACE)
+        before forcing our own full _connect() — and if Quotex explicitly
+        rate-limits us (429), we back off hard and don't touch _connect()
+        again until a much longer dedicated cooldown has passed,
+        regardless of the normal exponential schedule.
+
         Also detects STALE DATA STREAMS: the WebSocket connection itself
         can stay alive and pass get_balance() pings while a specific
         asset's price/candle subscription silently stops receiving
-        updates (observed: /price and /candles timing out for a single
-        asset for several minutes, resolved only by a full manual
-        restart). Since get_balance() alone can't detect this, we also
+        updates. Since get_balance() alone can't detect this, we also
         check whether any recently-subscribed asset has gone stale and
-        force a full reconnect if so — replicating what a manual restart
-        does, without requiring one.
+        force a full reconnect if so — but only outside the rate-limit
+        cooldown window.
         """
         last_reconnect = 0.0
         cooldown = 10.0
         max_cooldown = 600.0  # 10 minutes
         consecutive_failures = 0
-        STALE_DATA_THRESHOLD = 90.0  # seconds with zero fresh ticks on any tracked asset
+        first_failure_time = 0.0
+        RECONNECT_GRACE = 45.0  # let pyquotex's own reconnect try first
+        STALE_DATA_THRESHOLD = 90.0
+        RATE_LIMIT_COOLDOWN = 300.0  # 5 minutes, dedicated, on top of normal backoff
 
         while True:
             await asyncio.sleep(15)
+            now = time.time()
+
+            # Hard stop: if Quotex explicitly rate-limited us, do not touch
+            # _connect() at all until this window has fully passed, no
+            # matter what else happens.
+            if now < self._rate_limited_until:
+                continue
+
             try:
                 if self.client is None:
                     continue
@@ -164,10 +207,9 @@ class QuotexManager:
                 if consecutive_failures > 0:
                     logger.info("Quotex connection recovered after %d failed attempt(s)", consecutive_failures)
                 consecutive_failures = 0
+                first_failure_time = 0.0
                 cooldown = 10.0
 
-                # Connection pings fine — now check if subscribed data
-                # streams are actually still flowing.
                 stale = self._check_stale_streams(STALE_DATA_THRESHOLD)
                 if stale:
                     logger.warning(
@@ -175,23 +217,43 @@ class QuotexManager:
                         STALE_DATA_THRESHOLD, ", ".join(stale),
                     )
                     await self._connect()
-                    self._subscribed_assets.clear()  # re-subscribe fresh after reconnect
+                    self._subscribed_assets.clear()
             except Exception as exc:  # noqa: BLE001
                 self.connected = False
                 self.last_error = str(exc)
-                now = time.time()
+                exc_text = str(exc).lower()
+
+                # Quotex explicitly told us to back off — respect it fully,
+                # independent of the normal cooldown schedule.
+                if "429" in exc_text or "rate limit" in exc_text:
+                    self._rate_limited_until = now + RATE_LIMIT_COOLDOWN
+                    logger.error(
+                        "Quotex rate-limited us (429) — pausing ALL reconnect attempts for %.0fs",
+                        RATE_LIMIT_COOLDOWN,
+                    )
+                    continue
+
+                if consecutive_failures == 0:
+                    first_failure_time = now
+                consecutive_failures += 1
+
+                # Give pyquotex's own internal reconnect logic a real
+                # chance before we force a full fresh login on top of it.
+                if now - first_failure_time < RECONNECT_GRACE:
+                    logger.info(
+                        "Ping failed (%s) — within grace period, letting pyquotex's own reconnect attempt first",
+                        exc,
+                    )
+                    continue
+
                 if now - last_reconnect < cooldown:
                     continue
                 last_reconnect = now
-                consecutive_failures += 1
                 logger.warning(
-                    "Hard ping failed (%s), reconnecting... (attempt %d, next cooldown %.0fs)",
+                    "Hard ping failed (%s), forcing full reconnect... (attempt %d, next cooldown %.0fs)",
                     exc, consecutive_failures, cooldown,
                 )
                 await self._connect()
-                # Grow the cooldown for next time regardless of outcome —
-                # if _connect() succeeded, get_balance() will confirm on
-                # the next loop iteration and reset it back to 10s.
                 cooldown = min(cooldown * 2, max_cooldown)
 
     async def ensure_connected(self) -> Quotex:
@@ -201,6 +263,12 @@ class QuotexManager:
                 detail="Quotex client not configured (missing credentials).",
             )
         if not self.connected:
+            if time.time() < self._rate_limited_until:
+                remaining = int(self._rate_limited_until - time.time())
+                raise HTTPException(
+                    status_code=503,
+                    detail=f"Quotex rate-limited us; not attempting reconnect for {remaining}s more.",
+                )
             await self._connect()
         if not self.connected:
             raise HTTPException(
